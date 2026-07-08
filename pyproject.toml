@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "BiocoreagentV2.0"
+version = "2.0.0a2"
+description = "Auditable research-oriented coding agent harness with bioinformatics workflow routing"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+  "openai>=1.0",
+  "openpyxl>=3.1",
+  "pydantic>=2.0",
+  "python-docx>=1.0",
+]
+
+[project.optional-dependencies]
+bio = ["biopython>=1.83"]
+litellm = ["litellm>=1.60.0,<2.0.0"]
+dev = ["pytest>=8.0", "ruff>=0.4"]
+
+[project.scripts]
+biocoreagent-v2 = "biocoreagent.cli:main"
+biocoreagent = "biocoreagent.cli:main"
+biocore-mcp = "corecoder.mcp_server:main"
+biocore-doctor = "corecoder.bio_cli:main"
+
+[tool.setuptools.packages.find]
+include = ["biocoreagent*", "pico*", "corecoder*"]
+
+[tool.setuptools.package-data]
+"corecoder.bio" = ["skills/*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

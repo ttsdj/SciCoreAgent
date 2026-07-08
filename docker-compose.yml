@@ -1,0 +1,9 @@
+services:
+  biocoreagent-v2:
+    build: .
+    image: biocoreagent-v2:local
+    volumes:
+      - ./:/app
+      - ./workspace:/workspace
+    working_dir: /workspace
+    command: ["--help"]
