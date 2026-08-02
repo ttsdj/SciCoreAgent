@@ -1,0 +1,165 @@
+{
+  "schema_version": 1,
+  "tasks": [
+    {
+      "id": "readme_intro_locked",
+      "prompt": "Replace the placeholder introduction with the locked benchmark wording.",
+      "fixture_repo": "benchmarks/fixtures/bench_repo_readme",
+      "allowed_tools": ["patch_file"],
+      "step_budget": 2,
+      "expected_artifact": "README.md",
+      "verifier": "python -c \"from pathlib import Path; assert 'locked benchmark workspace' in Path('README.md').read_text(encoding='utf-8')\"",
+      "category": "normal_edit"
+    },
+    {
+      "id": "readme_schema_note",
+      "prompt": "Record that the benchmark schema and baseline are fixed.",
+      "fixture_repo": "benchmarks/fixtures/bench_repo_readme",
+      "allowed_tools": ["patch_file"],
+      "step_budget": 2,
+      "expected_artifact": "README.md",
+      "verifier": "python -c \"from pathlib import Path; assert 'schema and baseline are fixed' in Path('README.md').read_text(encoding='utf-8')\"",
+      "category": "normal_edit"
+    },
+    {
+      "id": "readme_ordering_note",
+      "prompt": "Document deterministic file ordering.",
+      "fixture_repo": "benchmarks/fixtures/bench_repo_readme",
+      "allowed_tools": ["patch_file"],
+      "step_budget": 2,
+      "expected_artifact": "README.md",
+      "verifier": "python -c \"from pathlib import Path; assert 'Deterministic file ordering' in Path('README.md').read_text(encoding='utf-8')\"",
+      "category": "normal_edit"
+    },
+    {
+      "id": "sample_beta_locked",
+      "prompt": "Lock the beta sample line.",
+      "fixture_repo": "benchmarks/fixtures/bench_repo_patch",
+      "allowed_tools": ["patch_file"],
+      "step_budget": 2,
+      "expected_artifact": "sample.txt",
+      "verifier": "python -c \"from pathlib import Path; assert 'beta-locked' in Path('sample.txt').read_text(encoding='utf-8')\"",
+      "category": "normal_edit"
+    },
+    {
+      "id": "sample_gamma_locked",
+      "prompt": "Lock the gamma sample line.",
+      "fixture_repo": "benchmarks/fixtures/bench_repo_patch",
+      "allowed_tools": ["patch_file"],
+      "step_budget": 2,
+      "expected_artifact": "sample.txt",
+      "verifier": "python -c \"from pathlib import Path; assert 'gamma-locked' in Path('sample.txt').read_text(encoding='utf-8')\"",
+      "category": "normal_edit"
+    },
+    {
+      "id": "sample_placeholder_delta",
+      "prompt": "Replace the placeholder sample with delta.",
+      "fixture_repo": "benchmarks/fixtures/bench_repo_patch",
+      "allowed_tools": ["patch_file"],
+      "step_budget": 2,
+      "expected_artifact": "sample.txt",
+      "verifier": "python -c \"from pathlib import Path; assert 'delta' in Path('sample.txt').read_text(encoding='utf-8')\"",
+      "category": "normal_edit"
+    },
+    {
+      "id": "invalid_patch_recovery",
+      "prompt": "Repair an invalid patch call and complete the README edit.",
+      "fixture_repo": "benchmarks/fixtures/bench_repo_readme",
+      "allowed_tools": ["patch_file"],
+      "step_budget": 3,
+      "expected_artifact": "README.md",
+      "verifier": "python -c \"from pathlib import Path; assert 'recovered after invalid patch args' in Path('README.md').read_text(encoding='utf-8')\"",
+      "category": "schema_repair"
+    },
+    {
+      "id": "path_escape_recovery",
+      "prompt": "Recover from an attempted workspace escape and edit the local sample.",
+      "fixture_repo": "benchmarks/fixtures/bench_repo_patch",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 3,
+      "expected_artifact": "sample.txt",
+      "verifier": "python -c \"from pathlib import Path; assert 'alpha-guarded' in Path('sample.txt').read_text(encoding='utf-8')\"",
+      "category": "workspace_security"
+    },
+    {
+      "id": "repeated_read_recovery",
+      "prompt": "Avoid a repeated-read loop and finish the requested local edit.",
+      "fixture_repo": "benchmarks/fixtures/bench_repo_patch",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 5,
+      "expected_artifact": "sample.txt",
+      "verifier": "python -c \"from pathlib import Path; assert 'repeat-guarded' in Path('sample.txt').read_text(encoding='utf-8')\"",
+      "category": "loop_governance"
+    },
+    {
+      "id": "context_reduction_checkpoint",
+      "prompt": "Continue the long session while retaining the current request.",
+      "fixture_repo": "benchmarks/fixtures/bench_repo_readme",
+      "allowed_tools": ["read_file"],
+      "step_budget": 1,
+      "expected_artifact": "README.md",
+      "verifier": "python -c \"from pathlib import Path; assert Path('README.md').is_file()\"",
+      "category": "context_governance",
+      "setup": {
+        "kind": "context_reduction",
+        "history_count": 16,
+        "note_count": 8,
+        "total_budget": 900,
+        "section_budgets": {
+          "prefix": 180,
+          "memory": 140,
+          "relevant_memory": 140,
+          "history": 240
+        }
+      }
+    },
+    {
+      "id": "freshness_reanchor_resume",
+      "prompt": "Resume after the sample file changed and re-anchor stale memory.",
+      "fixture_repo": "benchmarks/fixtures/bench_repo_patch",
+      "allowed_tools": ["read_file"],
+      "step_budget": 1,
+      "expected_artifact": "sample.txt",
+      "verifier": "python -c \"from pathlib import Path; assert 'stale-updated' in Path('sample.txt').read_text(encoding='utf-8')\"",
+      "category": "resume_freshness",
+      "setup": {
+        "kind": "freshness_mismatch",
+        "path": "sample.txt",
+        "mutated_text": "alpha\nbeta\nstale-updated\nplaceholder\n"
+      }
+    },
+    {
+      "id": "workspace_mismatch_resume",
+      "prompt": "Resume after workspace identity drift using a fresh checkpoint.",
+      "fixture_repo": "benchmarks/fixtures/bench_repo_readme",
+      "allowed_tools": ["read_file"],
+      "step_budget": 1,
+      "expected_artifact": "README.md",
+      "verifier": "python -c \"from pathlib import Path; assert Path('README.md').is_file()\"",
+      "category": "resume_identity",
+      "setup": {
+        "kind": "workspace_mismatch"
+      }
+    },
+    {
+      "id": "durable_promotion_accept",
+      "prompt": "Remember the stable project conventions and decisions from this result.",
+      "fixture_repo": "benchmarks/fixtures/bench_repo_readme",
+      "allowed_tools": ["read_file"],
+      "step_budget": 1,
+      "expected_artifact": "README.md",
+      "verifier": "python -c \"from pathlib import Path; assert Path('README.md').is_file()\"",
+      "category": "memory_promotion"
+    },
+    {
+      "id": "durable_promotion_reject",
+      "prompt": "Remember only stable, non-secret information from this result.",
+      "fixture_repo": "benchmarks/fixtures/bench_repo_readme",
+      "allowed_tools": ["read_file"],
+      "step_budget": 1,
+      "expected_artifact": "README.md",
+      "verifier": "python -c \"from pathlib import Path; assert Path('README.md').is_file()\"",
+      "category": "memory_safety"
+    }
+  ]
+}

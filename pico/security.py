@@ -1,9 +1,17 @@
 """Security and redaction helpers for runtime artifacts."""
 
 import os
+import re
 
 SENSITIVE_ENV_NAME_MARKERS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD")
 REDACTED_VALUE = "<redacted>"
+SECRET_TEXT_PATTERNS = (
+    re.compile(r"\bsk-[A-Za-z0-9_.-]{8,}\b"),
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}"),
+    re.compile(
+        r"(?i)\b(api[_ -]?key|token|secret|password)\s*(?:is|=|:)\s*[\"']?[^\s\"']{6,}[\"']?"
+    ),
+)
 
 
 def _normalized_secret_names(secret_env_names):
@@ -67,6 +75,8 @@ def redact_text(text, env=None, secret_env_names=None):
         reverse=True,
     ):
         text = text.replace(value, REDACTED_VALUE)
+    for pattern in SECRET_TEXT_PATTERNS:
+        text = pattern.sub(REDACTED_VALUE, text)
     return text
 
 

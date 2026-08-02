@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "case_id": "smoke-local",
+  "status": "ready",
+  "title": "Local runtime smoke replay",
+  "tags": [
+    "smoke",
+    "read-only"
+  ],
+  "input": {
+    "prompt": "Reply with exactly: BioCoreAgent replay OK"
+  },
+  "fixtures": [],
+  "runtime": {
+    "allowed_tools": [
+      "list_files"
+    ],
+    "max_steps": 3,
+    "max_new_tokens": 128,
+    "forbid_network": true
+  },
+  "verification": {
+    "final_nonempty": true,
+    "final_contains": [
+      "BioCoreAgent replay OK"
+    ],
+    "final_regex": [],
+    "expected_files": [],
+    "commands": [],
+    "expect_recovery": false
+  },
+  "budgets": {
+    "max_tool_steps": 1
+  }
+}

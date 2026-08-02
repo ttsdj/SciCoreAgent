@@ -1,4 +1,22 @@
 services:
+  memory-postgres:
+    image: postgres:15
+    profiles: ["memory"]
+    environment:
+      POSTGRES_DB: biocoreagent_memory
+      POSTGRES_USER: biocoreagent
+      # Development-only default. Production must supply an external secret.
+      POSTGRES_PASSWORD: biocoreagent_dev_only
+    ports:
+      - "127.0.0.1:54329:5432"
+    volumes:
+      - biocoreagent-memory-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U biocoreagent -d biocoreagent_memory"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
   biocoreagent-v2:
     build: .
     image: biocoreagent-v2:local
@@ -7,3 +25,6 @@ services:
       - ./workspace:/workspace
     working_dir: /workspace
     command: ["--help"]
+
+volumes:
+  biocoreagent-memory-postgres:

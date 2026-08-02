@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
 
-from pico.config import _parse_env_line
 from pico.cli import (
     _build_model_client,
     _configured_secret_names,
     _effective_model,
     _effective_provider,
+)
+from pico.cli import (
     build_arg_parser as build_pico_parser,
 )
-from pico.config import load_project_env
+from pico.config import _parse_env_line, load_project_env
 from pico.run_store import RunStore
 from pico.session_store import SessionStore
 from pico.workspace import WorkspaceContext
@@ -22,7 +24,6 @@ from pico.workspace import WorkspaceContext
 from .domain import ensure_workspace_state
 from .orchestrator import AsyncMultiAgentOrchestrator
 from .runtime import BioPico
-
 
 try:
     from colorama import just_fix_windows_console
@@ -184,7 +185,7 @@ def build_welcome(agent, provider: str, model: str, max_agents: int) -> str:
             row(f"Workspace : {agent.workspace.repo_root}"),
             row(f"Provider  : {provider}"),
             row(f"Model     : {model}"),
-            row(f"Role      : executor"),
+            row("Role      : executor"),
             row(f"Agents    : max {max_agents} concurrent workers"),
             row(f"Session   : {agent.session['id']}"),
             divider("-"),
@@ -219,6 +220,28 @@ def build_arg_parser():
     parser.description = "BiocoreagentV2.0: auditable multi-agent research coding harness."
     parser.set_defaults(max_steps=20, max_new_tokens=4096)
     parser.add_argument("--max-agents", type=int, default=4, help="Maximum concurrent sub-agents.")
+    parser.add_argument(
+        "--memory-source",
+        nargs=3,
+        metavar=("SESSION_ID", "START_MESSAGE", "END_MESSAGE"),
+        help="Print the exact persisted messages behind a memory source backlink and exit.",
+    )
+    parser.add_argument(
+        "--memory-timeline",
+        nargs=2,
+        metavar=("USER_SCOPE", "PROJECT_SCOPE"),
+        help="Print the effective-time research event timeline for one scope and exit.",
+    )
+    parser.add_argument(
+        "--memory-event",
+        metavar="EVENT_ID",
+        help="Explain one research graph event with its original evidence links and exit.",
+    )
+    parser.add_argument(
+        "--memory-causal",
+        metavar="EVENT_ID",
+        help="Print the caused-by/recovery/supersession chain for one event and exit.",
+    )
     return parser
 
 
@@ -233,13 +256,52 @@ def build_runtime(args):
     start_configured_mcp_servers(root)
     secret_names = _configured_secret_names(args)
     holder = {}
+    worker_config = {
+        "provider": getattr(args, "provider", None),
+        "model": getattr(args, "model", None),
+        "base_url": getattr(args, "base_url", None),
+        "host": getattr(args, "host", None),
+        "ollama_timeout": getattr(args, "ollama_timeout", 300),
+        "openai_timeout": getattr(args, "openai_timeout", 300),
+        "temperature": getattr(args, "temperature", 0.2),
+        "top_p": getattr(args, "top_p", 0.9),
+        "max_steps": getattr(args, "max_steps", 20),
+        "max_new_tokens": getattr(args, "max_new_tokens", 4096),
+        "secret_env_names": list(getattr(args, "secret_env_names", []) or []),
+    }
 
-    def create_agent(role: str = "executor", worker: bool = True):
-        session_store = SessionStore(state_root / "sessions")
-        run_store = RunStore(state_root / "runs")
+    def create_worker_command(job, worker_workspace: Path) -> list[str]:
+        task_path = worker_workspace / "worker_task.txt"
+        config_path = worker_workspace / "worker_config.json"
+        task_path.write_text(job.task, encoding="utf-8")
+        config_path.write_text(
+            json.dumps(worker_config, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return [
+            sys.executable,
+            "-m",
+            "biocoreagent.worker_process",
+            "--workspace-root",
+            str(root),
+            "--job-workspace",
+            str(worker_workspace),
+            "--role",
+            job.role,
+            "--task-file",
+            str(task_path),
+            "--config-file",
+            str(config_path),
+        ]
+
+    def create_agent(role: str = "executor", worker: bool = True, worker_workspace: Path | None = None):
+        agent_root = Path(worker_workspace).resolve() if worker_workspace is not None else root
+        agent_state_root = ensure_workspace_state(agent_root)
+        session_store = SessionStore(agent_state_root / "sessions")
+        run_store = RunStore(agent_state_root / "runs")
         return BioPico(
             model_client=_build_model_client(args),
-            workspace=WorkspaceContext.build(root),
+            workspace=WorkspaceContext.build(agent_root),
             session_store=session_store,
             run_store=run_store,
             approval_policy="auto" if worker else args.approval,
@@ -255,6 +317,8 @@ def build_runtime(args):
         root,
         agent_factory=create_agent,
         max_concurrency=args.max_agents,
+        process_command_factory=create_worker_command,
+        default_execution_mode="process",
     )
     holder["orchestrator"] = orchestrator
 
@@ -284,6 +348,50 @@ def build_runtime(args):
 def main(argv=None):
     enable_terminal_style()
     args = build_arg_parser().parse_args(argv)
+    if args.memory_source:
+        session_id, start, end = args.memory_source
+        cwd_root = Path(args.cwd).resolve()
+        repo_root = Path(WorkspaceContext.build(args.cwd).repo_root).resolve()
+        state_roots = [
+            cwd_root / ".biocoreagent" / "sessions",
+            cwd_root / ".pico" / "sessions",
+            repo_root / ".biocoreagent" / "sessions",
+            repo_root / ".pico" / "sessions",
+        ]
+        store_root = next((path for path in state_roots if path.exists()), None)
+        if store_root is None:
+            print("memory source error: no local session store exists", file=sys.stderr)
+            return 2
+        try:
+            excerpt = SessionStore(store_root).source_excerpt(session_id, int(start), int(end))
+        except (ValueError, TypeError) as exc:
+            print(f"memory source error: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps({"session_id": session_id, "messages": excerpt}, ensure_ascii=False, indent=2))
+        return 0
+    if args.memory_timeline or args.memory_event or args.memory_causal:
+        root = Path(WorkspaceContext.build(args.cwd).repo_root).resolve()
+        load_biocoreagent_env(root)
+        from pico.features.postgres_memory import PostgresLongTermMemoryStore
+
+        backend = PostgresLongTermMemoryStore.from_environment()
+        if backend is None:
+            print(
+                "research graph error: BIOCOREAGENT_MEMORY_POSTGRES_DSN is not configured",
+                file=sys.stderr,
+            )
+            return 2
+        if args.memory_timeline:
+            user_scope, project_scope = args.memory_timeline
+            result = backend.research_graph.timeline(
+                user_scope=user_scope, project_scope=project_scope
+            )
+        elif args.memory_event:
+            result = backend.research_graph.explain_event(args.memory_event)
+        else:
+            result = backend.research_graph.causal_chain(args.memory_causal)
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        return 0
     try:
         agent, orchestrator = build_runtime(args)
     except (RuntimeError, ValueError) as exc:
@@ -363,6 +471,7 @@ def main(argv=None):
             except KeyboardInterrupt:
                 print(assistant_line("interrupted; back to prompt. Type /exit to leave BioCoreAgent."))
     finally:
+        agent.shutdown()
         orchestrator.shutdown()
         try:
             from corecoder.mcp_client import get_mcp_provider

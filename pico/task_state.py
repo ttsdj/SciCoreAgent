@@ -13,6 +13,37 @@ STATUS_COMPLETED = "completed"
 STATUS_STOPPED = "stopped"
 STATUS_FAILED = "failed"
 
+TASK_TRANSITIONS = {
+    STATUS_RUNNING: frozenset({STATUS_COMPLETED, STATUS_STOPPED, STATUS_FAILED}),
+    STATUS_COMPLETED: frozenset(),
+    STATUS_STOPPED: frozenset(),
+    STATUS_FAILED: frozenset(),
+}
+
+PHASE_INITIALIZING = "initializing"
+PHASE_CONTEXT_BUILDING = "context_building"
+PHASE_MODEL_CALLING = "model_calling"
+PHASE_OUTPUT_PARSING = "output_parsing"
+PHASE_TOOL_EXECUTING = "tool_executing"
+PHASE_RECOVERING = "recovering"
+PHASE_FINALIZING = "finalizing"
+PHASE_TERMINATED = "terminated"
+
+TASK_PHASE_TRANSITIONS = {
+    PHASE_INITIALIZING: frozenset({PHASE_CONTEXT_BUILDING, PHASE_FINALIZING}),
+    PHASE_CONTEXT_BUILDING: frozenset({PHASE_MODEL_CALLING, PHASE_FINALIZING}),
+    PHASE_MODEL_CALLING: frozenset({PHASE_OUTPUT_PARSING, PHASE_FINALIZING}),
+    PHASE_OUTPUT_PARSING: frozenset(
+        {PHASE_CONTEXT_BUILDING, PHASE_TOOL_EXECUTING, PHASE_FINALIZING}
+    ),
+    PHASE_TOOL_EXECUTING: frozenset(
+        {PHASE_CONTEXT_BUILDING, PHASE_RECOVERING, PHASE_FINALIZING}
+    ),
+    PHASE_RECOVERING: frozenset({PHASE_FINALIZING}),
+    PHASE_FINALIZING: frozenset({PHASE_TERMINATED}),
+    PHASE_TERMINATED: frozenset(),
+}
+
 STOP_REASON_FINAL_ANSWER_RETURNED = "final_answer_returned"
 STOP_REASON_STEP_LIMIT_REACHED = "step_limit_reached"
 STOP_REASON_RETRY_LIMIT_REACHED = "retry_limit_reached"
@@ -37,6 +68,13 @@ class TaskState:
     final_answer: str = ""
     checkpoint_id: str = ""
     resume_status: str = ""
+    phase: str = PHASE_INITIALIZING
+
+    def __post_init__(self):
+        if self.status not in TASK_TRANSITIONS:
+            raise ValueError(f"unknown task lifecycle state: {self.status!r}")
+        if self.phase not in TASK_PHASE_TRANSITIONS:
+            raise ValueError(f"unknown task lifecycle phase: {self.phase!r}")
 
     @classmethod
     def create(cls, task_id, user_request, run_id=""):
@@ -46,11 +84,13 @@ class TaskState:
 
     @classmethod
     def from_dict(cls, data):
+        status = str(data.get("status", STATUS_RUNNING))
+        default_phase = PHASE_INITIALIZING if status == STATUS_RUNNING else PHASE_TERMINATED
         return cls(
             run_id=str(data.get("run_id", "")),
             task_id=str(data.get("task_id", "")),
             user_request=str(data.get("user_request", "")),
-            status=str(data.get("status", STATUS_RUNNING)),
+            status=status,
             tool_steps=int(data.get("tool_steps", 0)),
             attempts=int(data.get("attempts", 0)),
             last_tool=str(data.get("last_tool", "")),
@@ -58,6 +98,7 @@ class TaskState:
             final_answer=str(data.get("final_answer", "")),
             checkpoint_id=str(data.get("checkpoint_id", "")),
             resume_status=str(data.get("resume_status", "")),
+            phase=str(data.get("phase", default_phase)),
         )
 
     def record_attempt(self):
@@ -73,7 +114,7 @@ class TaskState:
 
     def stop(self, stop_reason, status=STATUS_STOPPED, final_answer=""):
         # stop_reason 和 status 分开存，是为了区分“怎么停的”和“停下时是什么状态”。
-        self.status = status
+        self.transition_to(status)
         self.stop_reason = stop_reason
         if final_answer != "":
             self.final_answer = final_answer
@@ -89,9 +130,33 @@ class TaskState:
         return self.stop(STOP_REASON_MODEL_ERROR, status=STATUS_FAILED, final_answer=final_answer)
 
     def finish_success(self, final_answer):
-        self.status = STATUS_COMPLETED
+        self.transition_to(STATUS_COMPLETED)
         self.stop_reason = STOP_REASON_FINAL_ANSWER_RETURNED
         self.final_answer = str(final_answer)
+        return self
+
+    def transition_to(self, status):
+        status = str(status)
+        if self.status not in TASK_TRANSITIONS:
+            raise ValueError(f"unknown task lifecycle state: {self.status!r}")
+        if status not in TASK_TRANSITIONS:
+            raise ValueError(f"unknown task lifecycle state: {status!r}")
+        if status != self.status and status not in TASK_TRANSITIONS[self.status]:
+            raise ValueError(f"illegal task lifecycle transition: {self.status!r} -> {status!r}")
+        self.status = status
+        return self
+
+    def transition_phase(self, phase):
+        phase = str(phase)
+        if self.phase not in TASK_PHASE_TRANSITIONS:
+            raise ValueError(f"unknown task lifecycle phase: {self.phase!r}")
+        if phase not in TASK_PHASE_TRANSITIONS:
+            raise ValueError(f"unknown task lifecycle phase: {phase!r}")
+        if phase != self.phase and phase not in TASK_PHASE_TRANSITIONS[self.phase]:
+            raise ValueError(
+                f"illegal task lifecycle phase transition: {self.phase!r} -> {phase!r}"
+            )
+        self.phase = phase
         return self
 
     def to_dict(self):
@@ -107,4 +172,5 @@ class TaskState:
             "final_answer": self.final_answer,
             "checkpoint_id": self.checkpoint_id,
             "resume_status": self.resume_status,
+            "phase": self.phase,
         }

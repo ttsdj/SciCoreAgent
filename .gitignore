@@ -12,6 +12,8 @@ __pycache__/
 .bio-test-tmp/
 .ruff_cache/
 .venv/
+node_modules/
+.codex/
 .pico/
 .biocoreagent/
 dist/
@@ -36,5 +38,7 @@ build/
 *.tar.gz
 data/
 results/
+note.txt
+proteomics_fallback_*/
 docs/biocore-v1/
 tests/biocore_legacy/

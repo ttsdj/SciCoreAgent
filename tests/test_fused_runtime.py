@@ -1,13 +1,16 @@
-from pathlib import Path
 import json
+from pathlib import Path
 
+import pytest
+
+from biocoreagent.analysis_router import route_analysis_task
+from biocoreagent.runtime import BioPico
 from pico.providers.clients import FakeModelClient
 from pico.run_store import RunStore
 from pico.session_store import SessionStore
+from pico.task_state import PHASE_TERMINATED
+from pico.tool_executor import ToolExecutor, ToolManager
 from pico.workspace import WorkspaceContext
-
-from biocoreagent.runtime import BioPico
-from biocoreagent.analysis_router import route_analysis_task
 
 
 def build_agent(tmp_path: Path, outputs, role="executor"):
@@ -21,6 +24,25 @@ def build_agent(tmp_path: Path, outputs, role="executor"):
         role=role,
         allow_orchestration=False,
     )
+
+
+def test_tool_manager_is_the_single_compatible_execution_gateway(tmp_path):
+    agent = build_agent(tmp_path, [])
+
+    assert isinstance(agent.tool_manager, ToolManager)
+    assert agent.tool_executor is agent.tool_manager
+    assert ToolExecutor is ToolManager
+    assert agent.tool_manager.registry is agent.tools
+
+    agent.tool_manager.cancel()
+    cancelled = agent.execute_tool("list_files", {"path": "."})
+    assert cancelled.metadata["tool_status"] == "rejected"
+    assert cancelled.metadata["tool_error_code"] == "tool_cancelled"
+    assert cancelled.metadata["execution_id"].startswith("tool_")
+
+    agent.tool_manager.begin_run()
+    completed = agent.execute_tool("list_files", {"path": "."})
+    assert completed.metadata["tool_status"] == "ok"
 
 
 def test_bio_tool_runs_through_pico_loop_and_persists_run(tmp_path):
@@ -38,9 +60,101 @@ def test_bio_tool_runs_through_pico_loop_and_persists_run(tmp_path):
 
     assert result == "Matrix inspected."
     assert agent.current_task_state.status == "completed"
+    assert agent.current_task_state.phase == PHASE_TERMINATED
     assert agent.current_task_state.tool_steps == 1
     assert agent.current_task_state.last_tool == "bio_count_matrix_inspect"
     assert (tmp_path / ".biocoreagent" / "runs" / agent.current_task_state.run_id / "trace.jsonl").exists()
+    trace_path = tmp_path / ".biocoreagent" / "runs" / agent.current_task_state.run_id / "trace.jsonl"
+    phase_events = [
+        json.loads(line)["to_phase"]
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+        if json.loads(line).get("event") == "task_phase_changed"
+    ]
+    assert phase_events == [
+        "context_building",
+        "model_calling",
+        "output_parsing",
+        "tool_executing",
+        "context_building",
+        "model_calling",
+        "output_parsing",
+        "finalizing",
+        "terminated",
+    ]
+    audit_dir = tmp_path / ".biocoreagent" / "audit" / "sessions" / agent.session["id"]
+    assert (audit_dir / "messages.jsonl").exists()
+    assert (audit_dir / "tool_calls.jsonl").exists()
+    assert (audit_dir / "artifacts.jsonl").exists()
+    assert (audit_dir / "audit_index.json").exists()
+    tool_events = [
+        json.loads(line)
+        for line in (audit_dir / "tool_calls.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(event["tool"] == "bio_count_matrix_inspect" and event["status"] == "ok" for event in tool_events)
+    artifact_events = [
+        json.loads(line)
+        for line in (audit_dir / "artifacts.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert {event["kind"] for event in artifact_events} >= {"task_state", "trace", "run_report"}
+
+
+def test_model_error_persists_failed_terminal_task_state_and_trace(tmp_path):
+    class FailingClient(FakeModelClient):
+        def complete(self, prompt, max_new_tokens, **kwargs):
+            raise RuntimeError("simulated model outage")
+
+    agent = BioPico(
+        model_client=FailingClient([]),
+        workspace=WorkspaceContext.build(tmp_path),
+        session_store=SessionStore(tmp_path / ".biocoreagent" / "sessions"),
+        run_store=RunStore(tmp_path / ".biocoreagent" / "runs"),
+        approval_policy="auto",
+        role="executor",
+        allow_orchestration=False,
+    )
+
+    with pytest.raises(RuntimeError, match="simulated model outage"):
+        agent.ask("trigger model failure")
+
+    assert agent.current_task_state.status == "failed"
+    assert agent.current_task_state.phase == PHASE_TERMINATED
+    assert agent.current_task_state.stop_reason == "model_error"
+    run_dir = tmp_path / ".biocoreagent" / "runs" / agent.current_task_state.run_id
+    persisted = json.loads((run_dir / "task_state.json").read_text(encoding="utf-8"))
+    assert persisted["status"] == "failed"
+    assert persisted["phase"] == PHASE_TERMINATED
+    events = [
+        json.loads(line)["event"]
+        for line in (run_dir / "trace.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert "exception_raised" in events
+    assert events[-1] == "run_finished"
+
+
+def test_audit_redacts_secret_tool_arguments(tmp_path):
+    agent = build_agent(tmp_path, [])
+
+    agent.execute_tool("read_file", {"path": "../outside.txt", "api_key": "sk-very-secret-token"})
+
+    audit_dir = tmp_path / ".biocoreagent" / "audit" / "sessions" / agent.session["id"]
+    text = (audit_dir / "tool_calls.jsonl").read_text(encoding="utf-8")
+    assert "sk-very-secret-token" not in text
+    assert "[REDACTED]" in text
+    assert (audit_dir / "errors.jsonl").exists()
+
+
+def test_runtime_redacts_secret_shaped_free_text(tmp_path):
+    agent = build_agent(tmp_path, [])
+
+    redacted = agent.redact_text(
+        "API key is sk-benchmark-secret and Authorization: Bearer abcdefghijklmnop"
+    )
+
+    assert "sk-benchmark-secret" not in redacted
+    assert "abcdefghijklmnop" not in redacted
+    assert redacted.count("<redacted>") >= 2
 
 
 def test_role_tool_boundaries_are_enforced_at_registry_level(tmp_path):

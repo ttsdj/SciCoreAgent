@@ -18,6 +18,14 @@ if _loaded_path and _PACKAGE_ROOT not in _loaded_path.parents:
             del sys.modules[_module_name]
 
 from .runtime import BioPico
-from .orchestrator import AsyncMultiAgentOrchestrator
+from .lifecycle import JobStatus, TeamStatus
+from .orchestrator import AsyncMultiAgentOrchestrator, ReplanNode, ReplanPatch
 
-__all__ = ["AsyncMultiAgentOrchestrator", "BioPico"]
+__all__ = [
+    "AsyncMultiAgentOrchestrator",
+    "BioPico",
+    "JobStatus",
+    "ReplanNode",
+    "ReplanPatch",
+    "TeamStatus",
+]

@@ -20,18 +20,22 @@ dependencies = [
 bio = ["biopython>=1.83"]
 litellm = ["litellm>=1.60.0,<2.0.0"]
 dev = ["pytest>=8.0", "ruff>=0.4"]
+memory-postgres = ["psycopg[binary]>=3.1", "sentence-transformers>=3.0"]
 
 [project.scripts]
 biocoreagent-v2 = "biocoreagent.cli:main"
 biocoreagent = "biocoreagent.cli:main"
 biocore-mcp = "corecoder.mcp_server:main"
 biocore-doctor = "corecoder.bio_cli:main"
+biocore-bixbench = "corecoder.eval.bixbench:main"
+biocore-replay = "biocoreagent.replay_cli:main"
 
 [tool.setuptools.packages.find]
 include = ["biocoreagent*", "pico*", "corecoder*"]
 
 [tool.setuptools.package-data]
 "corecoder.bio" = ["skills/*.md"]
+"corecoder.eval" = ["bixbench_smoke.json", "bixbench_fixtures/rnaseq_small/*.tsv"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

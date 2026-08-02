@@ -26,6 +26,7 @@ class SkillMetadata:
     tags: list[str]
     path: str
     updated_at: str
+    version: int = 1
 
 
 def skills_dir(root: str | Path | None = None) -> Path:
@@ -63,6 +64,11 @@ def save_skill(
         raise FileExistsError(f"skill already exists: {slug}")
 
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    version = 1
+    if path.exists():
+        existing = _metadata_from_file(path)
+        version = max(1, int(existing.version)) + 1
+        _archive_skill_version(path, existing.version)
     clean_tags = _normalize_tags(tags or [])
     content = _render_skill(
         slug=slug,
@@ -75,10 +81,13 @@ def save_skill(
         source_task=source_task.strip(),
         tags=clean_tags,
         updated_at=now,
+        version=version,
     )
     base.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
-    return SkillMetadata(slug, title.strip(), summary.strip(), clean_tags, str(path), now)
+    temporary = path.with_suffix(".md.tmp")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.replace(path)
+    return SkillMetadata(slug, title.strip(), summary.strip(), clean_tags, str(path), now, version)
 
 
 def install_skill_from_path(
@@ -221,6 +230,7 @@ def _render_skill(
     source_task: str,
     tags: list[str],
     updated_at: str,
+    version: int,
 ) -> str:
     tag_text = ", ".join(tags)
     sections = [
@@ -229,6 +239,7 @@ def _render_skill(
         f"title: {title}",
         f"summary: {summary}",
         f"tags: {tag_text}",
+        f"version: {version}",
         f"updated_at: {updated_at}",
         "---",
         "",
@@ -261,7 +272,24 @@ def _metadata_from_file(path: Path) -> SkillMetadata:
     summary = front.get("summary") or ""
     tags = _normalize_tags((front.get("tags") or "").split(","))
     updated_at = front.get("updated_at") or ""
-    return SkillMetadata(slug, title, summary, tags, str(path.resolve()), updated_at)
+    try:
+        version = max(1, int(front.get("version") or 1))
+    except ValueError:
+        version = 1
+    return SkillMetadata(slug, title, summary, tags, str(path.resolve()), updated_at, version)
+
+
+def _archive_skill_version(path: Path, version: int) -> Path:
+    archive_dir = path.parent / ".history" / path.stem
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive_path = archive_dir / f"v{max(1, int(version))}_{stamp}.md"
+    counter = 1
+    while archive_path.exists():
+        archive_path = archive_dir / f"v{max(1, int(version))}_{stamp}_{counter}.md"
+        counter += 1
+    archive_path.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    return archive_path
 
 
 def _parse_front_matter(text: str) -> dict[str, str]:
@@ -310,6 +338,7 @@ def _with_front_matter(text: str, slug: str, title: str, summary: str, updated_a
             f"title: {title}",
             f"summary: {summary}",
             "tags: imported",
+            "version: 1",
             f"updated_at: {updated_at}",
             "---",
             "",

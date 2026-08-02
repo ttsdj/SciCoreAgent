@@ -508,7 +508,7 @@ class BenchmarkEvaluator:
             non_failure_stop_reason=non_failure_stop_reason,
         )
 
-        return {
+        row = {
             "id": task["id"],
             "prompt": task["prompt"],
             "fixture_repo": task["fixture_repo"],
@@ -546,6 +546,7 @@ class BenchmarkEvaluator:
             "task_state": task_state.to_dict(),
             "report": report,
         }
+        return agent.redact_artifact(row)
 
     def _failure_category(
         self,

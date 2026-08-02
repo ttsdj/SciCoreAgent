@@ -5,6 +5,7 @@ Pico 就是包在模型外面的控制循环：负责组 prompt、解析模型�
 """
 
 import json
+import os
 import hashlib
 import os
 import re
@@ -16,13 +17,14 @@ from . import checkpoint as checkpointlib
 from .features import memory as memorylib
 from . import security as securitylib
 from .context_manager import ContextManager
+from .memory_pipeline import MemoryPipeline
 from .checkpoint import CHECKPOINT_NONE_STATUS
 from .prompt_prefix import build_prompt_prefix, tool_signature
 from .run_store import RunStore
 from .security import REDACTED_VALUE
 from .session_store import SessionStore
 from .tool_context import ToolContext
-from .tool_executor import ToolExecutor
+from .tool_executor import ToolManager
 from . import tools as toolkit
 from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
 
@@ -68,6 +70,7 @@ class Pico:
         secret_env_names=None,
         feature_flags=None,
         allowed_tools=None,
+        trace_context=None,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -85,6 +88,7 @@ class Pico:
         if feature_flags:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
         self.allowed_tools = self._normalize_allowed_tools(allowed_tools)
+        self.trace_context = dict(trace_context or {})
         self.run_store = run_store or RunStore(Path(workspace.repo_root) / ".pico" / "runs")
         self.session = session or {
             "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
@@ -99,8 +103,10 @@ class Pico:
             workspace_root=self.root,
         )
         self.session["memory"] = self.memory.to_dict()
+        self.memory_pipeline = MemoryPipeline(self.session_store, workspace_root=self.root)
         self.tools = self._apply_tool_allowlist(self.build_tools())
-        self.tool_executor = ToolExecutor(self)
+        self.tool_manager = ToolManager(self)
+        self.tool_executor = self.tool_manager
         self.prefix_state = self.build_prefix()
         self.prefix = self.prefix_state.text
         self.context_manager = ContextManager(self)
@@ -113,7 +119,11 @@ class Pico:
         self.last_durable_promotions = []
         self.last_durable_rejections = []
         self.last_durable_superseded = []
+        self.last_memory_pipeline_status = {}
         self._last_tool_result_metadata = {}
+        self._trace_sequences = {}
+        self._trace_ids = {}
+        self._last_trace_event_ids = {}
         self._last_prefix_refresh = {
             "workspace_changed": False,
             "prefix_changed": False,
@@ -339,11 +349,38 @@ class Pico:
 
     def emit_trace(self, task_state, event, payload=None):
         payload = self.redact_artifact(payload or {})
-        payload["event"] = event
-        payload["created_at"] = now()
+        run_id = str(getattr(task_state, "run_id", "") or "")
+        sequence = int(self._trace_sequences.get(run_id, 0)) + 1
+        self._trace_sequences[run_id] = sequence
+        self._trace_ids.setdefault(run_id, "trace_" + uuid.uuid4().hex[:16])
+        event_id = "evt_" + uuid.uuid4().hex[:16]
+        canonical_types = {
+            "model_parsed": "model_response_parsed",
+            "tool_executed": "tool_call_completed",
+            "recovery_gate_triggered": "recovery_completed",
+        }
+        timestamp = now()
+        envelope = {
+            **self.redact_artifact(self.trace_context),
+            **payload,
+            "schema_version": 3,
+            "event_id": event_id,
+            "sequence": sequence,
+            "trace_id": self._trace_ids[run_id],
+            "session_id": str(self.session.get("id", "")),
+            "run_id": run_id,
+            "task_id": str(getattr(task_state, "task_id", "") or ""),
+            "parent_event_id": self._last_trace_event_ids.get(run_id, ""),
+            "event_type": canonical_types.get(event, event),
+            "actor": f"agent:{getattr(self, 'role', 'main')}",
+            "occurred_at": timestamp,
+            "event": event,
+            "created_at": timestamp,
+        }
+        self._last_trace_event_ids[run_id] = event_id
         # trace 是运行中的逐事件时间线，适合回答“这一轮 agent 到底做了什么”。
-        self.run_store.append_trace(task_state, payload)
-        return payload
+        self.run_store.append_trace(task_state, envelope)
+        return envelope
 
     def capture_workspace_snapshot(self):
         snapshot = {}
@@ -497,12 +534,34 @@ class Pico:
         self.last_durable_promotions = promoted
         self.last_durable_rejections = rejections
         self.last_durable_superseded = superseded
+        # Preserve every final session as chunked evidence first.  If Postgres
+        # is configured the durable outbox is distilled immediately; otherwise
+        # it remains locally queued for a later service-enabled retry.
+        queued = self.memory_pipeline.capture(
+            self.session,
+            metadata={
+                "user_scope": os.environ.get("BIOCOREAGENT_MEMORY_USER_SCOPE", "").strip(),
+                "project_scope": str(self.root),
+            },
+        )
+        self.last_memory_pipeline_status = {
+            "chunks_enqueued": queued,
+            **self.memory_pipeline.drain_async(),
+        }
         return promoted, rejections, superseded
 
     def ask(self, user_message, stream_callback=None):
         from .agent_loop import AgentLoop
 
         return AgentLoop(self).run(user_message, stream_callback=stream_callback)
+
+    def shutdown(self):
+        """Flush bounded background work during a clean runtime shutdown."""
+        return self.memory_pipeline.close()
+
+    def finalize_answer(self, answer):
+        """Domain runtimes may validate the answer before it becomes evidence."""
+        return str(answer)
 
     def execute_tool(self, name, args):
         result = self.tool_executor.execute(name, args)
@@ -636,11 +695,13 @@ class Pico:
             "attempts": task_state.attempts,
             "checkpoint_id": task_state.checkpoint_id,
             "resume_status": task_state.resume_status,
+            "phase": task_state.phase,
             "task_state": task_state.to_dict(),
             "prompt_metadata": self.last_prompt_metadata,
             "durable_promotions": list(self.last_durable_promotions),
             "durable_rejections": list(self.last_durable_rejections),
             "durable_superseded": list(self.last_durable_superseded),
+            "memory_pipeline": dict(self.last_memory_pipeline_status),
             "redacted_env": self.detected_secret_env_summary(),
         }
 

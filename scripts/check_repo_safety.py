@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
+import subprocess
 import sys
 
 
@@ -63,9 +64,27 @@ def should_skip(path: Path) -> bool:
     return False
 
 
+def release_files() -> list[Path]:
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            cwd=ROOT,
+            capture_output=True,
+            check=True,
+        )
+        relative_paths = [
+            Path(item.decode("utf-8", errors="replace"))
+            for item in result.stdout.split(b"\0")
+            if item
+        ]
+        return [ROOT / path for path in relative_paths]
+    except Exception:
+        return [path for path in ROOT.rglob("*") if path.is_file()]
+
+
 def main() -> int:
     problems: list[str] = []
-    for path in ROOT.rglob("*"):
+    for path in release_files():
         if path.is_dir() or should_skip(path):
             continue
         if not path.exists():

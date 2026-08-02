@@ -4,19 +4,35 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from dataclasses import replace
 from pathlib import Path
 
 from pico import tools as pico_tools
 from pico.prompt_prefix import PromptPrefix
 from pico.runtime import Pico
-from pico.workspace import clip
+from pico.task_state import TaskState
+from pico.workspace import clip, now
 
 from .analysis_router import route_analysis_task
 from .analysis_verifier import verify_final_answer
+from .audit import AuditTrail
+from .capabilities import default_capability_registry
 from .domain import build_domain_adapters
+from .evidence import EvidenceManager
 from .fallback_runner import run_fallback_analysis
 from .result_exporter import export_result_table_to_csv, is_csv_export_request
+from .workflow_ir import (
+    CapabilityInvocation,
+    EvidenceArtifact,
+    ExecutionResult,
+    FinalSynthesis,
+    VerificationCheck,
+    VerificationResult,
+    WorkflowManifest,
+    WorkflowManifestStore,
+    evidence_artifact,
+)
 
 
 DOI_PATTERN = re.compile(r"\b10\.\d{4,9}/[^\s,;\"'<>]+")
@@ -96,7 +112,232 @@ class BioPico(Pico):
         self.allow_orchestration = allow_orchestration
         self._domain_adapters = build_domain_adapters()
         self.last_auto_sedimentations = []
+        self._dream_manager = None
         super().__init__(*args, **kwargs)
+        self.audit_trail = AuditTrail(
+            self.root,
+            str(self.session.get("id", "")),
+            actor=f"agent:{self.role}",
+        )
+        self.evidence_manager = EvidenceManager(
+            self.root,
+            self.run_store.root.parent,
+            redactor=self.redact_text,
+        )
+        self._pending_evidence_tool = None
+        self._last_direct_artifacts: list[str] = []
+        self.last_direct_task_state: TaskState | None = None
+        self.audit_trail.append(
+            "message",
+            {
+                "role": "system",
+                "content_preview": "session started",
+                "workspace_root": str(self.root),
+                "role_name": self.role,
+                "approval_policy": self.approval_policy,
+                "max_steps": self.max_steps,
+                "tool_count": len(self.tools),
+            },
+        )
+        self.capability_registry = default_capability_registry()
+        self.workflow_store = WorkflowManifestStore(self.root)
+        self.current_workflow_manifest: WorkflowManifest | None = None
+        self.current_workflow_path: Path | None = None
+
+    def _apply_tool_allowlist(self, tools):
+        """Validate allowlists against the fused registry, including domain tools."""
+        if self.allowed_tools is None:
+            return tools
+        unknown = [name for name in self.allowed_tools if name not in tools]
+        if unknown:
+            raise ValueError(f"unknown allowed tool: {', '.join(unknown)}")
+        allowed = set(self.allowed_tools)
+        return {name: tool for name, tool in tools.items() if name in allowed}
+
+    def record(self, item):
+        super().record(item)
+        role = str(item.get("role", ""))
+        if role in {"user", "assistant", "tool"}:
+            task_state = getattr(self, "current_task_state", None)
+            self.audit_trail.log_message(
+                role,
+                item.get("content", ""),
+                run_id=getattr(task_state, "run_id", "") or "",
+                task_id=getattr(task_state, "task_id", "") or "",
+            )
+
+    def consume_agent_completions(self) -> str:
+        """Persist and inject newly completed child-agent results once."""
+        if self.orchestrator is None or not self.allow_orchestration:
+            return ""
+        state = self.session.setdefault("orchestrator", {})
+        cursor = int(state.get("completion_cursor", 0))
+        updates = self.orchestrator.completion_updates(
+            str(self.session.get("id", "")),
+            after_sequence=cursor,
+        )
+        if not updates:
+            return ""
+        lines = [
+            "Supervisor completion inbox (new durable child-agent results):",
+        ]
+        for item in updates:
+            status = item.get("status", "unknown")
+            if item.get("kind") == "agent_team_completed":
+                lines.append(
+                    f"- team {item.get('team_id')} [{status}], "
+                    f"degradation={item.get('degradation_level', 0)}, "
+                    f"verified={item.get('verification_passed')}"
+                )
+                lines.append(str(item.get("synthesis", ""))[:6000])
+            else:
+                lines.append(
+                    f"- job {item.get('job_id')} {item.get('name')} "
+                    f"({item.get('role')}) [{status}]"
+                )
+                lines.append(
+                    str(item.get("result") or item.get("error") or "(no result)")[:3000]
+                )
+            artifacts = item.get("artifact_paths", [])
+            if artifacts:
+                lines.append("  artifacts: " + ", ".join(str(path) for path in artifacts[:12]))
+        state["completion_cursor"] = max(int(item["sequence"]) for item in updates)
+        content = "\n".join(lines)
+        self.record(
+            {
+                "role": "system",
+                "content": content,
+                "created_at": now(),
+                "metadata": {
+                    "kind": "orchestrator_completion_reinjection",
+                    "completion_ids": [item.get("completion_id", "") for item in updates],
+                },
+            }
+        )
+        self.audit_trail.append(
+            "message",
+            {
+                "role": "supervisor",
+                "content_preview": content[:1200],
+                "kind": "orchestrator_completion_reinjection",
+                "completion_ids": [item.get("completion_id", "") for item in updates],
+            },
+        )
+        return content
+
+    def emit_trace(self, task_state, event, payload=None):
+        emitted = super().emit_trace(task_state, event, payload)
+        if event == "run_started":
+            self.evidence_manager.begin_run(
+                str(getattr(task_state, "run_id", "") or ""),
+                self.run_store.run_dir(task_state),
+                str(emitted.get("event_id", "")),
+            )
+        else:
+            self.evidence_manager.note_event(emitted)
+        if event == "tool_executed" and self._pending_evidence_tool is not None:
+            pending = self._pending_evidence_tool
+            self._pending_evidence_tool = None
+            bundles = self.evidence_manager.record_tool_completion(
+                name=pending["name"],
+                args=pending["args"],
+                result=pending["result"].content,
+                metadata=pending["result"].metadata,
+                event_id=str(emitted.get("event_id", "")),
+            )
+            for bundle in bundles:
+                self.emit_trace(
+                    task_state,
+                    "artifact_created",
+                    {
+                        "artifact_path": bundle["artifact_path"],
+                        "deliverable_bundle": bundle["bundle_path"],
+                        "source_tool_event": emitted.get("event_id", ""),
+                    },
+                )
+        if event == "run_finished":
+            self.evidence_manager.finish_run(str(emitted.get("event_id", "")))
+        self.audit_trail.log_trace_event(
+            event,
+            emitted,
+            run_id=getattr(task_state, "run_id", "") or "",
+            task_id=getattr(task_state, "task_id", "") or "",
+        )
+        if event == "run_finished":
+            # The Pico loop writes report.json immediately after this trace
+            # event.  BioPico.ask finalizes the audit after super().ask()
+            # returns, so all run artifacts are present before hashing.
+            pass
+        return emitted
+
+    def execute_tool(self, name, args):
+        if getattr(self, "current_task_state", None) is not None:
+            if name == "run_shell":
+                self.evidence_manager.capture_code_tree(
+                    version_role="pre_shell",
+                    captured_at_event=self.evidence_manager.last_event_id,
+                )
+            else:
+                self.evidence_manager.capture_paths(
+                    self._tool_path_arguments(args or {}),
+                    version_role="pre_tool",
+                    captured_at_event=self.evidence_manager.last_event_id,
+                )
+        result = super().execute_tool(name, args)
+        if getattr(self, "current_task_state", None) is not None:
+            self._pending_evidence_tool = {
+                "name": name,
+                "args": dict(args or {}),
+                "result": result,
+            }
+        if getattr(self, "current_task_state", None) is None:
+            self.audit_trail.log_tool_call(
+                name=name,
+                args=args or {},
+                result=result.content,
+                metadata=result.metadata,
+            )
+        return result
+
+    @staticmethod
+    def _tool_path_arguments(args: dict) -> list[str]:
+        values = []
+        for key, value in args.items():
+            if not isinstance(value, str):
+                continue
+            if re.search(r"(?i)(path|file|script|input|output)", str(key)):
+                values.append(value)
+        return values
+
+    def approve(self, name, args):
+        task_state = getattr(self, "current_task_state", None)
+        if task_state is not None:
+            self.emit_trace(
+                task_state,
+                "approval_requested",
+                {"action": name, "args": args or {}, "risk_level": "high"},
+            )
+        decision = super().approve(name, args)
+        if task_state is not None:
+            self.emit_trace(
+                task_state,
+                "approval_decided",
+                {
+                    "action": name,
+                    "decision": "approved" if decision else "denied",
+                    "approval_policy": self.approval_policy,
+                },
+            )
+        self.audit_trail.log_approval(
+            action=name,
+            args=args or {},
+            decision="approved" if decision else "denied",
+            reason=f"approval_policy={self.approval_policy}",
+            risk_level="high",
+            run_id=getattr(task_state, "run_id", "") or "",
+            task_id=getattr(task_state, "task_id", "") or "",
+        )
+        return decision
 
     def build_tools(self):
         tools = pico_tools.build_tool_registry(self.tool_context())
@@ -172,26 +413,264 @@ class BioPico(Pico):
         return replace(prefix, text=text, hash=hashlib.sha256(text.encode("utf-8")).hexdigest())
 
     def ask(self, user_message, stream_callback=None):
+        # A new request must not attach shortcut/tool evidence to a prior run.
+        self.current_task_state = None
+        self.current_run_dir = None
+        shortcut_user_logged = False
         export_result = self._try_csv_export_shortcut(user_message)
         if export_result is not None:
+            export_completed = export_result.startswith("CSV 导出完成")
+            self._record_direct_delivery(
+                user_message,
+                export_result,
+                kind="csv_export_shortcut",
+                completed=export_completed,
+            )
+            self.audit_trail.log_message("user", user_message)
+            shortcut_user_logged = True
+            self.audit_trail.log_message("assistant", export_result)
+            self.audit_trail.finalize(
+                final_status="completed" if export_completed else "stopped",
+                final_answer=export_result,
+            )
             self.last_auto_sedimentations = []
             return export_result
         route = route_analysis_task(user_message)
         self.last_analysis_route = route.to_dict()
+        if route.analysis_type != "coding" and route.intent == "run_analysis":
+            self.current_workflow_manifest = self.workflow_store.create(user_message, route)
+            self.current_workflow_path = self.workflow_store.save(self.current_workflow_manifest)
+        else:
+            self.current_workflow_manifest = None
+            self.current_workflow_path = None
+        self.audit_trail.append(
+            "message",
+            {
+                "role": "system",
+                "content_preview": "analysis route selected",
+                "route": self.last_analysis_route,
+            },
+        )
         if route.analysis_type == "bulk_rnaseq" and route.intent == "run_analysis":
             shortcut = self._try_bio_shortcut(user_message, force=True)
             if shortcut is not None:
+                shortcut = verify_final_answer(shortcut)
+                self._finalize_current_workflow(shortcut)
+                workflow_status = self._current_workflow_status("completed")
+                self._record_direct_delivery(
+                    user_message,
+                    shortcut,
+                    kind="bulk_rnaseq_shortcut",
+                    completed=workflow_status == "completed",
+                )
+                if not shortcut_user_logged:
+                    self.audit_trail.log_message("user", user_message)
+                self.audit_trail.log_message("assistant", shortcut)
+                self.audit_trail.finalize(
+                    final_status=self._current_workflow_status("completed"),
+                    final_answer=shortcut,
+                )
                 self.last_auto_sedimentations = []
-                return verify_final_answer(shortcut)
+                return shortcut
         if route.analysis_type in {"proteomics", "single_cell", "generic_table"} and route.intent == "run_analysis":
             fallback = self._try_fallback_analysis(user_message, route)
             if fallback is not None:
+                fallback = verify_final_answer(fallback)
+                self._finalize_current_workflow(fallback)
+                workflow_status = self._current_workflow_status("completed")
+                self._record_direct_delivery(
+                    user_message,
+                    fallback,
+                    kind=f"{route.analysis_type}_fallback",
+                    completed=workflow_status == "completed",
+                )
+                if not shortcut_user_logged:
+                    self.audit_trail.log_message("user", user_message)
+                self.audit_trail.log_message("assistant", fallback)
+                self.audit_trail.finalize(
+                    final_status=self._current_workflow_status("completed"),
+                    final_answer=fallback,
+                )
                 self.last_auto_sedimentations = []
-                return verify_final_answer(fallback)
-        final = super().ask(user_message, stream_callback=stream_callback)
-        final = verify_final_answer(final)
-        self.last_auto_sedimentations = self._auto_sediment(user_message, final)
-        return final
+                return fallback
+        try:
+            final = super().ask(user_message, stream_callback=stream_callback)
+            final = verify_final_answer(final)
+            self.last_auto_sedimentations = self._auto_sediment(user_message, final)
+            task_state = getattr(self, "current_task_state", None)
+            if task_state is not None:
+                self.run_store.write_report(
+                    task_state,
+                    self.redact_artifact(self.build_report(task_state)),
+                )
+                self.evidence_manager.build_evidence_index(self._runtime_identity())
+                self.audit_trail.register_run_artifacts(
+                    self.run_store.run_dir(task_state),
+                    run_id=getattr(task_state, "run_id", "") or "",
+                    task_id=getattr(task_state, "task_id", "") or "",
+                )
+                self.audit_trail.finalize(
+                    final_status=getattr(task_state, "status", ""),
+                    final_answer=final,
+                )
+            return final
+        except Exception as exc:
+            task_state = getattr(self, "current_task_state", None)
+            if task_state is not None and getattr(task_state, "status", "") == "running":
+                task_state.stop_model_error(str(exc))
+                self.run_store.write_task_state(task_state)
+                self.emit_trace(
+                    task_state,
+                    "exception_raised",
+                    {
+                        "exception_type": exc.__class__.__name__,
+                        "message": str(exc),
+                        "recovery_status": "unrecovered",
+                    },
+                )
+                self.emit_trace(
+                    task_state,
+                    "final_delivery",
+                    {"final_answer": str(exc), "delivery_status": "failed"},
+                )
+                self.emit_trace(
+                    task_state,
+                    "run_finished",
+                    {
+                        "status": task_state.status,
+                        "stop_reason": task_state.stop_reason,
+                        "final_answer": str(exc),
+                    },
+                )
+                self.run_store.write_report(
+                    task_state,
+                    self.redact_artifact(self.build_report(task_state)),
+                )
+                self.evidence_manager.build_evidence_index(self._runtime_identity())
+                self.audit_trail.register_run_artifacts(
+                    self.run_store.run_dir(task_state),
+                    run_id=getattr(task_state, "run_id", "") or "",
+                    task_id=getattr(task_state, "task_id", "") or "",
+                )
+            self.audit_trail.log_error(
+                category=exc.__class__.__name__,
+                source="BioPico.ask",
+                message=str(exc),
+                run_id=getattr(task_state, "run_id", "") or "",
+                task_id=getattr(task_state, "task_id", "") or "",
+            )
+            self.audit_trail.finalize(final_status="error", final_answer=str(exc))
+            raise
+
+    def finalize_answer(self, answer):
+        return verify_final_answer(str(answer))
+
+    def _runtime_identity(self) -> dict:
+        return {
+            "agent_role": self.role,
+            "approval_policy": self.approval_policy,
+            "max_steps": self.max_steps,
+            "max_new_tokens": self.max_new_tokens,
+            "model_client": self.model_client.__class__.__name__,
+            "model": str(getattr(self.model_client, "model", "")),
+            "tool_names": sorted(self.tools),
+            "tool_signature": str(getattr(self.prefix_state, "tool_signature", "")),
+        }
+
+    def _record_direct_delivery(
+        self,
+        user_message: str,
+        answer: str,
+        *,
+        kind: str,
+        completed: bool,
+    ) -> None:
+        """Give deterministic shortcuts the same evidence lifecycle as AgentLoop."""
+        task_state = TaskState.create(
+            task_id=self.new_task_id(),
+            run_id=self.new_run_id(),
+            user_request=user_message,
+        )
+        self.current_task_state = task_state
+        self.current_run_dir = self.run_store.start_run(task_state)
+        self.emit_trace(
+            task_state,
+            "run_started",
+            {"task_id": task_state.task_id, "user_request": clip(user_message, 300)},
+        )
+        self.emit_trace(task_state, "user_input_recorded", {"user_input": user_message})
+        self.emit_trace(task_state, "shortcut_selected", {"shortcut_kind": kind})
+
+        artifact_paths = list(self._last_direct_artifacts)
+        manifest = self.current_workflow_manifest
+        if self.current_workflow_path is not None:
+            artifact_paths.append(str(self.current_workflow_path))
+        if manifest is not None and manifest.verification is not None:
+            artifact_paths.extend(manifest.verification.verified_artifacts)
+        for value in dict.fromkeys(artifact_paths):
+            path = Path(value)
+            absolute = path if path.is_absolute() else self.root / path
+            if not absolute.is_file():
+                continue
+            bundle = self.evidence_manager.create_deliverable(
+                absolute,
+                tool_name=kind,
+                tool_args={},
+                tool_result=answer,
+                tool_metadata={
+                    "tool_status": "ok" if completed else "error",
+                    "execution_id": kind,
+                    "duration_ms": 0,
+                },
+                event_id=self.evidence_manager.last_event_id,
+            )
+            if bundle is not None:
+                self.emit_trace(
+                    task_state,
+                    "artifact_created",
+                    {
+                        "artifact_path": str(absolute),
+                        "deliverable_bundle": str(bundle),
+                        "source_shortcut": kind,
+                    },
+                )
+        self._last_direct_artifacts = []
+
+        if completed:
+            task_state.finish_success(answer)
+        else:
+            task_state.stop(f"{kind}_stopped", final_answer=answer)
+        self.run_store.write_task_state(task_state)
+        self.emit_trace(
+            task_state,
+            "final_delivery",
+            {
+                "final_answer": answer,
+                "delivery_status": "completed" if completed else "stopped",
+            },
+        )
+        self.emit_trace(
+            task_state,
+            "run_finished",
+            {
+                "status": task_state.status,
+                "stop_reason": task_state.stop_reason,
+                "final_answer": answer,
+            },
+        )
+        self.run_store.write_report(
+            task_state,
+            self.redact_artifact(self.build_report(task_state)),
+        )
+        self.evidence_manager.build_evidence_index(self._runtime_identity())
+        self.audit_trail.register_run_artifacts(
+            self.run_store.run_dir(task_state),
+            run_id=task_state.run_id,
+            task_id=task_state.task_id,
+        )
+        self.last_direct_task_state = task_state
+        self.current_task_state = None
+        self.current_run_dir = None
 
     def _try_csv_export_shortcut(self, user_message: str) -> str | None:
         if not is_csv_export_request(user_message):
@@ -199,11 +678,13 @@ class BioPico(Pico):
         self._emit_progress("识别为结果表 CSV 导出任务，使用确定性转换路径，不进入工具循环。")
         result = export_result_table_to_csv(self.root, user_message)
         if result.status != "completed":
+            self._last_direct_artifacts = []
             return (
                 "CSV 导出未完成：没有进入模型工具循环，已在确定性导出层停止。\n\n"
                 f"- 原因: {result.message}\n"
                 "- 请明确提供源文件路径，例如：deseq2_el_vs_rest_results.txt 输出成 csv。"
             )
+        self._last_direct_artifacts = [result.source_path, result.output_path]
         return (
             "CSV 导出完成。\n\n"
             f"- 源文件: {result.source_path}\n"
@@ -230,12 +711,14 @@ class BioPico(Pico):
         if path and not target:
             target = _infer_target_tissue_from_matrix_and_text(path, request)
         if not path:
+            self._record_workflow_blocker("count_matrix_missing")
             return (
                 "Bulk RNA-seq deterministic workflow requires a count matrix path before execution.\n"
                 "Please provide a .txt/.tsv/.csv count matrix and the target group, for example: "
                 "C:\\path\\counts.txt, target group el, compare el vs rest."
             )
         if not target:
+            self._record_workflow_blocker("target_group_missing")
             return (
                 "Bulk RNA-seq deterministic workflow found the count matrix but could not determine the target group.\n"
                 f"Count matrix: {path}\n"
@@ -266,10 +749,41 @@ class BioPico(Pico):
                 omicverse_payload = json.loads(check_result.content)
             except Exception:
                 omicverse_payload = {"raw_result": check_result.content}
+        if "workflow_plan_prepare" in self.tools:
+            plan_result = self.execute_tool(
+                "workflow_plan_prepare",
+                {
+                    "task": request,
+                    "input_files": [path],
+                    "analysis_type": "deseq2",
+                    "target_group": target,
+                    "mode": "quick",
+                    "output_dir": str(Path(path).resolve().parent / ".biocoreagent" / "plans"),
+                },
+            )
+            try:
+                plan_payload = json.loads(plan_result.content)
+            except Exception:
+                plan_payload = {"raw_result": plan_result.content}
+        else:
+            plan_payload = {
+                "steps": list(transcriptome_plan.get("steps", [])),
+                "artifacts": {},
+                "message": "Execute the deterministic transcriptome capability chain.",
+            }
+        approved = self._approve_generated_plan(plan_payload)
+        self._record_workflow_plan(plan_payload, approved)
+        if not approved:
+            return _format_plan_rejected_result(
+                target=target,
+                transcriptome_plan=transcriptome_plan,
+                omicverse_payload=omicverse_payload,
+                plan_payload=plan_payload,
+            )
         if omicverse_payload.get("available") and "transcriptome_omicverse_deg" in self.tools:
             self._emit_progress("OmicVerse 可用，执行 OmicVerse pyDEG 差异分析。")
-            result = self.execute_tool(
-                "transcriptome_omicverse_deg",
+            omicverse_result = self._invoke_registered_capability(
+                "omicverse_bulk_deg",
                 {
                     "count_matrix_path": path,
                     "target_group": target,
@@ -279,10 +793,6 @@ class BioPico(Pico):
                     "n_cpus": 2,
                 },
             )
-            try:
-                omicverse_result = json.loads(result.content)
-            except Exception:
-                omicverse_result = {"raw_result": result.content}
             if omicverse_result.get("status") == "completed":
                 return (
                     f"OmicVerse-backed bulk RNA-seq analysis completed for {target}-vs-rest.\n"
@@ -292,12 +802,13 @@ class BioPico(Pico):
                     f"- summary: {json.dumps(omicverse_result.get('summary', {}), ensure_ascii=False)}"
                 )
         if "bio_deseq2_tissue_vs_rest" not in self.tools:
+            self._record_workflow_blocker("no_executable_de_backend")
             return (
                 "Bulk RNA-seq deterministic workflow was selected, but no executable DE backend is available.\n"
                 f"- transcriptome plan: {json.dumps(transcriptome_plan.get('steps', []), ensure_ascii=False)}\n"
                 f"- OmicVerse backend: {json.dumps(omicverse_payload, ensure_ascii=False)}"
             )
-        if "workflow_plan_prepare" in self.tools:
+        if "workflow_plan_prepare" in self.tools and not plan_payload:
             self._emit_progress("生成正式计划文档 plan.md / plan.json / delegation.json。")
             plan_result = self.execute_tool(
                 "workflow_plan_prepare",
@@ -314,7 +825,9 @@ class BioPico(Pico):
                 plan_payload = json.loads(plan_result.content)
             except Exception:
                 plan_payload = {"raw_result": plan_result.content}
-            if not self._approve_generated_plan(plan_payload):
+            approved = self._approve_generated_plan(plan_payload)
+            self._record_workflow_plan(plan_payload, approved)
+            if not approved:
                 return _format_plan_rejected_result(
                     target=target,
                     transcriptome_plan=transcriptome_plan,
@@ -322,8 +835,8 @@ class BioPico(Pico):
                     plan_payload=plan_payload,
                 )
         self._emit_progress("计划已通过，执行 DESeq2 fallback 并验证结果文件。")
-        result = self.execute_tool(
-            "bio_deseq2_tissue_vs_rest",
+        payload = self._invoke_registered_capability(
+            "deseq2_bulk_deg",
             {
                 "count_matrix_path": path,
                 "target_tissue": target,
@@ -332,10 +845,6 @@ class BioPico(Pico):
                 "timeout": 600,
             },
         )
-        try:
-            payload = json.loads(result.content)
-        except Exception:
-            payload = {"raw_result": result.content}
         if payload.get("status") == "completed":
             return _format_bulk_rnaseq_result(
                 target=target,
@@ -367,6 +876,7 @@ class BioPico(Pico):
             f"识别为 {route.analysis_type} 分析任务，当前没有专用封装能力，进入受控 fallback。"
         )
         if not route.input_path:
+            self._record_workflow_blocker("input_path_missing")
             return (
                 "分析未完成：已进入受控 fallback，但没有找到输入文件路径。\n\n"
                 f"- 路由结果: {json.dumps(route.to_dict(), ensure_ascii=False)}\n"
@@ -383,7 +893,9 @@ class BioPico(Pico):
                 "controlled table-summary script, run it once, and stop on classified errors."
             ),
         }
-        if route.requires_plan and not self._approve_generated_plan(plan_payload):
+        approved = not route.requires_plan or self._approve_generated_plan(plan_payload)
+        self._record_workflow_plan(plan_payload, approved)
+        if route.requires_plan and not approved:
             return (
                 "已停止：fallback 计划已生成，但用户未审批继续执行。\n\n"
                 f"- 路由结果: {json.dumps(route.to_dict(), ensure_ascii=False)}\n"
@@ -393,6 +905,7 @@ class BioPico(Pico):
         self._emit_progress("写入一个主脚本并立即运行；不进入反复读脚本/改脚本循环。")
         result = run_fallback_analysis(self.root, route.analysis_type, route.input_path)
         payload = result.to_dict()
+        self._record_fallback_result(route.analysis_type, payload)
         if result.status == "completed":
             return (
                 "受控 fallback 已完成：已生成表格结构与数值列摘要。\n\n"
@@ -418,6 +931,153 @@ class BioPico(Pico):
             f"- summary: {result.summary_path}\n\n"
             "下一步最小动作：根据 error_type 修复输入路径、数据格式或环境后重跑；不会继续盲目循环。"
         )
+
+    def _invoke_registered_capability(self, name: str, parameters: dict) -> dict:
+        invocation, execution, verification, payload = self.capability_registry.invoke(
+            self, name, parameters
+        )
+        manifest = self.current_workflow_manifest
+        if manifest is not None:
+            manifest.invocations.append(invocation)
+            manifest.executions.append(execution)
+            manifest.verification = verification
+            self.current_workflow_path = self.workflow_store.save(manifest)
+        return payload
+
+    def _record_workflow_plan(self, plan_payload: dict, approved: bool) -> None:
+        manifest = self.current_workflow_manifest
+        if manifest is None:
+            return
+        artifacts = dict(plan_payload.get("artifacts", {}) or {})
+        steps = []
+        if isinstance(plan_payload.get("steps"), list):
+            steps = [str(item) for item in plan_payload["steps"]]
+        manifest.plan.status = "approved" if approved else "rejected"
+        manifest.plan.approved_by = "user" if approved else ""
+        manifest.plan.approved_at = manifest.updated_at if approved else None
+        manifest.plan.steps = steps
+        manifest.plan.expected_artifacts = [str(value) for value in artifacts.values() if value]
+        self.current_workflow_path = self.workflow_store.save(manifest)
+
+    def _record_workflow_blocker(self, blocker: str) -> None:
+        manifest = self.current_workflow_manifest
+        if manifest is None:
+            return
+        manifest.verification = VerificationResult(
+            status="blocked",
+            checks=[VerificationCheck(name="preflight", status="fail", message=str(blocker))],
+        )
+        self.current_workflow_path = self.workflow_store.save(manifest)
+
+    def _record_fallback_result(self, analysis_type: str, payload: dict) -> None:
+        manifest = self.current_workflow_manifest
+        if manifest is None:
+            return
+        invocation = CapabilityInvocation(
+            invocation_id="invocation_" + uuid.uuid4().hex[:12],
+            capability_name="controlled_fallback_script",
+            backend="generic_script",
+            parameters={
+                "analysis_type": str(analysis_type),
+                "input_path": str(payload.get("input_path", "")),
+            },
+            expected_artifacts=["script_path", "summary_path", "stdout_path", "stderr_path"],
+            deterministic=True,
+            risk_level="medium",
+        )
+        artifact_keys = ("script_path", "summary_path", "stdout_path", "stderr_path")
+        artifacts: list[EvidenceArtifact] = [
+            evidence_artifact(payload[key], kind=key)
+            for key in artifact_keys
+            if payload.get(key)
+        ]
+        summary_artifact = next((item for item in artifacts if item.kind == "summary_path"), None)
+        success = str(payload.get("status", "")) == "completed" and bool(
+            summary_artifact and summary_artifact.exists
+        )
+        verification = VerificationResult(
+            status="passed" if success else "failed",
+            checks=[
+                VerificationCheck(
+                    name="fallback_status",
+                    status="pass" if str(payload.get("status", "")) == "completed" else "fail",
+                    message=str(payload.get("status", "")),
+                ),
+                VerificationCheck(
+                    name="summary_artifact",
+                    status="pass" if summary_artifact and summary_artifact.exists else "fail",
+                    message=str(payload.get("summary_path", "")),
+                ),
+            ],
+            verified_artifacts=[
+                item.path for item in artifacts if item.exists and item.kind == "summary_path"
+            ],
+        )
+        execution = ExecutionResult(
+            invocation_id=invocation.invocation_id,
+            status="completed" if success else "failed",
+            backend="generic_script",
+            exit_code=payload.get("returncode"),
+            artifacts=artifacts,
+            stdout_path=str(payload.get("stdout_path", "")),
+            stderr_path=str(payload.get("stderr_path", "")),
+            error_type=str(payload.get("error_type", "")),
+            blocker=str(payload.get("blocker", "")),
+        )
+        manifest.invocations.append(invocation)
+        manifest.executions.append(execution)
+        manifest.verification = verification
+        self.current_workflow_path = self.workflow_store.save(manifest)
+
+    def _finalize_current_workflow(self, answer: str) -> None:
+        manifest = self.current_workflow_manifest
+        if manifest is None or manifest.final is not None:
+            return
+        completed = any(item.status == "completed" for item in manifest.executions)
+        degraded = any(item.status == "degraded" for item in manifest.executions)
+        passed = bool(manifest.verification and manifest.verification.status == "passed")
+        if completed and passed:
+            status = "completed"
+        elif degraded:
+            status = "degraded"
+        elif manifest.plan.status == "rejected" or not manifest.executions:
+            status = "blocked"
+        else:
+            status = "failed"
+        blockers = [item.blocker for item in manifest.executions if item.blocker]
+        if manifest.verification is not None:
+            blockers.extend(
+                item.message
+                for item in manifest.verification.checks
+                if item.status == "fail" and item.message
+            )
+        if status == "completed":
+            blockers = []
+        evidence_paths = (
+            list(manifest.verification.verified_artifacts)
+            if manifest.verification is not None
+            else []
+        )
+        manifest.final = FinalSynthesis(
+            status=status,
+            summary=clip(str(answer), 1200),
+            unresolved_blockers=list(dict.fromkeys(blockers)),
+            evidence_paths=evidence_paths,
+        )
+        self.current_workflow_path = self.workflow_store.save(manifest)
+        self.audit_trail.log_artifact(
+            path=self.current_workflow_path,
+            kind="workflow_manifest",
+            description="Versioned governed analysis workflow manifest",
+            source="workflow_runtime",
+            verified=status == "completed",
+        )
+
+    def _current_workflow_status(self, default: str) -> str:
+        manifest = self.current_workflow_manifest
+        if manifest is None or manifest.final is None:
+            return default
+        return manifest.final.status
 
     def _emit_progress(self, message: str) -> None:
         callback = getattr(self, "progress_callback", None)
@@ -492,6 +1152,17 @@ class BioPico(Pico):
         if "code_literature_link_save" not in used_tools:
             events.extend(self._auto_save_code_literature_links(user_message, final_answer, turn_tools))
 
+        try:
+            dream = self._get_dream_manager().submit(
+                user_message,
+                final_answer,
+                turn_tools,
+                source_session=str(self.session.get("id", "")),
+            )
+            events.append({"kind": "dream_background_review", **dream})
+        except Exception as exc:
+            events.append({"kind": "background_review_error", "error": str(exc)})
+
         if events:
             self.memory.append_note(
                 "Auto-sedimentation: " + ", ".join(event["kind"] for event in events),
@@ -502,6 +1173,24 @@ class BioPico(Pico):
             self.session["memory"] = self.memory.to_dict()
             self.session_path = self.session_store.save(self.session)
         return events
+
+    def _get_dream_manager(self):
+        if self._dream_manager is None:
+            from corecoder.sedimentation import DreamSedimentationManager
+
+            self._dream_manager = DreamSedimentationManager(self.root)
+        return self._dream_manager
+
+    def dream_status(self, job_id: str) -> dict | None:
+        if self._dream_manager is None:
+            return None
+        return self._dream_manager.status(job_id)
+
+    def shutdown(self) -> None:
+        if self._dream_manager is not None:
+            self._dream_manager.close()
+            self._dream_manager = None
+        super().shutdown()
 
     def _current_turn_tool_events(self) -> list[dict]:
         history = list(self.session.get("history", []))
@@ -592,7 +1281,15 @@ class BioPico(Pico):
     def build_report(self, task_state):
         report = super().build_report(task_state)
         report["agent_role"] = self.role
-        report["auto_sedimentations"] = list(self.last_auto_sedimentations)
+        sedimentations = []
+        for event in self.last_auto_sedimentations:
+            hydrated = dict(event)
+            if event.get("kind") == "dream_background_review":
+                current = self.dream_status(str(event.get("job_id", "")))
+                if current:
+                    hydrated.update(current)
+            sedimentations.append(hydrated)
+        report["auto_sedimentations"] = sedimentations
         return report
 
 

@@ -17,11 +17,10 @@ Reference: BioCoreCoder 需求文档, Section 5 (Skill 路由).
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Skill Tier — 三层技能分层
@@ -72,6 +71,10 @@ class SkillRoute:
     input_schema: dict | None = None
     output_schema: dict | None = None
     auto_chain: bool = False
+    tags: list[str] = field(default_factory=list)
+    applicable_when: list[str] = field(default_factory=list)
+    boundaries: list[str] = field(default_factory=list)
+    examples: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -85,6 +88,10 @@ class SkillRoute:
             "next_skills": self.next_skills,
             "required_tools": self.required_tools,
             "auto_chain": self.auto_chain,
+            "tags": self.tags,
+            "applicable_when": self.applicable_when,
+            "boundaries": self.boundaries,
+            "examples": self.examples,
         }
 
 
@@ -135,6 +142,7 @@ class SkillRouter:
         self._routes: dict[str, SkillRoute] = {}
         self._active_skills: set[str] = set()  # 当前会话已执行的技能
         self._chain_history: list[str] = []  # 技能执行链
+        self.last_route_diagnostics: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Registration
@@ -183,10 +191,14 @@ class SkillRouter:
         user_intent: str,
         max_results: int = 5,
         min_score: float = 0.1,
+        candidate_limit: int = 30,
     ) -> list[RoutingResult]:
         """根据用户意图匹配最合适的技能。
 
-        匹配策略：
+        二阶段匹配策略：先从紧凑 Skill Catalog 元数据召回有界候选集，
+        再结合触发词、适用条件、示例、边界、层级和优先级进行精排。
+
+        精排信号：
         1. 精确关键词匹配（权重 0.8）
         2. 部分关键词匹配（权重 0.5）
         3. 语义关联匹配（权重 0.3）
@@ -194,8 +206,15 @@ class SkillRouter:
         """
         intent_lower = user_intent.lower()
         results: list[RoutingResult] = []
+        candidates = self._recall_candidates(user_intent, limit=candidate_limit)
 
-        for route in self._routes.values():
+        for route, recall_score, _recall_reasons in candidates:
+            if any(
+                boundary.strip().lower() in intent_lower
+                for boundary in route.boundaries
+                if boundary.strip()
+            ):
+                continue
             matched_triggers: list[str] = []
             score = 0.0
 
@@ -218,12 +237,27 @@ class SkillRouter:
                     matched_triggers.append(trigger)
                     score += 0.3
 
-            if not matched_triggers:
+            metadata_matches = [
+                value
+                for value in (
+                    route.tags + route.applicable_when + route.examples + [route.title]
+                )
+                if _catalog_match(str(value), intent_lower)
+            ]
+            if not matched_triggers and not metadata_matches:
                 continue
 
             # 归一化分数
             max_possible = len(route.triggers) * 0.8
-            score = min(score / max(max_possible, 0.1), 1.0)
+            trigger_score = min(score / max(max_possible, 0.1), 1.0)
+            metadata_score = min(len(metadata_matches) / 3.0, 1.0)
+            priority_score = max(0.0, min(float(route.priority) / 100.0, 1.0))
+            score = (
+                0.62 * trigger_score
+                + 0.20 * metadata_score
+                + 0.10 * recall_score
+                + 0.08 * priority_score
+            )
 
             # 已执行的技能降权
             if route.slug in self._active_skills:
@@ -268,7 +302,53 @@ class SkillRouter:
 
         # 按分数降序排列
         results.sort(key=lambda r: (-r.score, -r.skill.priority))
+        self.last_route_diagnostics = {
+            "strategy": "catalog_recall_then_metadata_rerank",
+            "catalog_size": len(self._routes),
+            "candidate_count": len(candidates),
+            "candidate_limit": max(1, int(candidate_limit)),
+            "returned_count": min(len(results), max(0, int(max_results))),
+            "candidates": [
+                {
+                    "slug": route.slug,
+                    "recall_score": round(recall_score, 4),
+                    "reasons": reasons,
+                }
+                for route, recall_score, reasons in candidates
+            ],
+        }
         return results[:max_results]
+
+    def _recall_candidates(self, user_intent: str, *, limit: int = 30):
+        """Stage 1: retrieve from catalog metadata without loading Skill bodies."""
+        intent = str(user_intent).lower()
+        candidates = []
+        for route in self._routes.values():
+            fields = {
+                "title": [route.title],
+                "trigger": route.triggers,
+                "tag": route.tags,
+                "applicable_when": route.applicable_when,
+                "example": route.examples,
+            }
+            reasons = []
+            score = 0.0
+            for field_name, values in fields.items():
+                for value in values:
+                    value = str(value).strip().lower()
+                    if not value:
+                        continue
+                    if value in intent:
+                        reasons.append(f"{field_name}:exact")
+                        score += 1.0 if field_name == "trigger" else 0.7
+                    elif _catalog_match(value, intent):
+                        reasons.append(f"{field_name}:token")
+                        score += 0.55 if field_name == "trigger" else 0.35
+            if reasons:
+                normalized = min(score / max(1.0, len(route.triggers)), 1.0)
+                candidates.append((route, normalized, sorted(set(reasons))))
+        candidates.sort(key=lambda item: (-item[1], -item[0].priority, item[0].slug))
+        return candidates[: max(1, int(limit))]
 
     def route_exact(self, slug: str) -> RoutingResult | None:
         """按 slug 精确查找路由。"""
@@ -667,6 +747,23 @@ def _fuzzy_match(pattern: str, text: str, threshold: float = 0.6) -> bool:
             if pi == len(pattern):
                 return True
     return pi / len(pattern) >= threshold
+
+
+def _catalog_match(pattern: str, text: str) -> bool:
+    """Cheap multilingual catalog recall used before metadata reranking."""
+    pattern = str(pattern).lower()
+    text = str(text).lower()
+    if pattern in text:
+        return True
+    pattern_tokens = set(
+        re.findall(r"[a-z0-9_-]{2,}|[\u4e00-\u9fff]{2,}", pattern)
+    )
+    text_tokens = set(
+        re.findall(r"[a-z0-9_-]{2,}|[\u4e00-\u9fff]{2,}", text)
+    )
+    if pattern_tokens & text_tokens:
+        return True
+    return _fuzzy_match(pattern, text)
 
 
 def skill_router_prompt_context(router: SkillRouter | None = None) -> str:

@@ -111,6 +111,10 @@ class ContextManager:
             "history": "",
             CURRENT_REQUEST_SECTION: f"Current user request:\n{user_message}",
         }
+        if hasattr(self.agent, "consume_agent_completions"):
+            completion_text = str(self.agent.consume_agent_completions() or "").strip()
+            if completion_text:
+                section_texts["prefix"] += "\n\n" + completion_text
         checkpoint_text = ""
         if hasattr(self.agent, "render_checkpoint_text"):
             checkpoint_text = str(self.agent.render_checkpoint_text() or "").strip()
@@ -366,6 +370,8 @@ class ContextManager:
             "collapsed_duplicate_reads": 0,
             "reused_file_summary_count": 0,
             "summarized_tool_count": 0,
+            "duplicate_chars_removed": 0,
+            "structured_chars_removed": 0,
         }
 
         for index, item in enumerate(history):
@@ -384,13 +390,21 @@ class ContextManager:
                 path = str(item["args"].get("path", "")).strip()
                 if path in seen_older_reads:
                     details["collapsed_duplicate_reads"] += 1
+                    details["duplicate_chars_removed"] += len(
+                        "\n".join(self._render_history_item(item, max(20, len(str(item.get("content", ""))))))
+                    )
                     continue
                 seen_older_reads.add(path)
                 summary = self._reusable_file_summary(path)
                 if summary:
-                    entries.append({"recent": False, "lines": [f"{path} -> {summary}"]})
+                    summary_line = f"{path} -> {summary}"
+                    entries.append({"recent": False, "lines": [summary_line]})
                     details["older_entries_count"] += 1
                     details["reused_file_summary_count"] += 1
+                    raw_chars = len(
+                        "\n".join(self._render_history_item(item, max(20, len(str(item.get("content", ""))))))
+                    )
+                    details["structured_chars_removed"] += max(0, raw_chars - len(summary_line))
                     continue
 
             if item["role"] == "tool":
@@ -398,6 +412,10 @@ class ContextManager:
                 entries.append({"recent": False, "lines": [summary_line]})
                 details["older_entries_count"] += 1
                 details["summarized_tool_count"] += 1
+                raw_chars = len(
+                    "\n".join(self._render_history_item(item, max(20, len(str(item.get("content", ""))))))
+                )
+                details["structured_chars_removed"] += max(0, raw_chars - len(summary_line))
                 continue
 
             entries.append({"recent": False, "lines": self._render_history_item(item, 60)})
@@ -466,8 +484,66 @@ class ContextManager:
             "budget_chars": None,
             "rendered_chars": len(rendered[CURRENT_REQUEST_SECTION].rendered),
         }
+        raw_prompt_chars = sum(item["raw_chars"] for item in section_metadata.values())
+        raw_prompt_chars += 2 * max(0, len(SECTION_ORDER) - 1)
+        duplicate_chars_removed = int(rendered["history"].details.get("duplicate_chars_removed", 0))
+        structured_chars_removed = int(rendered["history"].details.get("structured_chars_removed", 0))
+        adaptive_budget_delta = sum(
+            max(0, int(item.get("before_chars", 0)) - int(item.get("after_chars", 0)))
+            for item in reduction_log
+        )
+        total_removed = max(0, raw_prompt_chars - len(prompt))
+        remaining_removed = total_removed
+        adaptive_budget_delta = min(adaptive_budget_delta, remaining_removed)
+        remaining_removed -= adaptive_budget_delta
+        duplicate_chars_removed = min(duplicate_chars_removed, remaining_removed)
+        remaining_removed -= duplicate_chars_removed
+        structured_chars_removed = min(structured_chars_removed, remaining_removed)
+        remaining_removed -= structured_chars_removed
+        budget_chars_removed = remaining_removed
+        compression_ratio = (
+            total_removed / raw_prompt_chars
+            if raw_prompt_chars
+            else 0.0
+        )
+        compression_layers = [
+            {
+                "layer": 1,
+                "name": "budget_clip",
+                "description": "Clip stable prompt sections and oversized tool output to their section budgets.",
+                "removed_chars": budget_chars_removed,
+                "triggered": budget_chars_removed > 0,
+            },
+            {
+                "layer": 2,
+                "name": "redundancy_prune",
+                "description": "Remove repeated historical reads of the same file.",
+                "removed_chars": duplicate_chars_removed,
+                "triggered": duplicate_chars_removed > 0,
+            },
+            {
+                "layer": 3,
+                "name": "structured_compact",
+                "description": "Replace old tool payloads with structured command/file summaries.",
+                "removed_chars": structured_chars_removed,
+                "triggered": structured_chars_removed > 0,
+            },
+            {
+                "layer": 4,
+                "name": "adaptive_threshold_trim",
+                "description": "Lower section budgets in priority order when the assembled prompt exceeds the global threshold.",
+                "removed_chars": adaptive_budget_delta,
+                "triggered": bool(reduction_log),
+            },
+        ]
         return {
             "prompt_chars": len(prompt),
+            "raw_prompt_chars": raw_prompt_chars,
+            "compressed_chars": len(prompt),
+            "removed_chars": total_removed,
+            "compression_ratio": round(compression_ratio, 6),
+            "approx_prompt_tokens": (len(prompt) + 3) // 4,
+            "compression_layers": compression_layers,
             "prompt_budget_chars": self.total_budget,
             "prompt_over_budget": len(prompt) > self.total_budget,
             "section_order": list(SECTION_ORDER),
@@ -499,6 +575,8 @@ class ContextManager:
                 "collapsed_duplicate_reads": int(rendered["history"].details.get("collapsed_duplicate_reads", 0)),
                 "reused_file_summary_count": int(rendered["history"].details.get("reused_file_summary_count", 0)),
                 "summarized_tool_count": int(rendered["history"].details.get("summarized_tool_count", 0)),
+                "duplicate_chars_removed": duplicate_chars_removed,
+                "structured_chars_removed": structured_chars_removed,
             },
             "current_request": {
                 "text": user_message,
